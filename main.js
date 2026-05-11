@@ -23,7 +23,7 @@ let allChats = [];
 let accounts = [];
 let clients = new Map();
 
-// ========== FLOOD HANDLERS ==========
+// ========== FLOOD И SLOW MODE HANDLERS ==========
 
 function getFloodWaitSeconds(error) {
   if (error.message && error.message.match(/FLOOD_WAIT_(\d+)/i)) {
@@ -45,6 +45,15 @@ function getFloodWaitSeconds(error) {
   return null;
 }
 
+function getSlowModeWaitSeconds(error) {
+  const msg = error.message || '';
+  const match = msg.match(/wait of (\d+) seconds/i);
+  if (match) {
+    return parseInt(match[1], 10);
+  }
+  return null;
+}
+
 function isFloodError(error) {
   if (error.name === 'FloodWaitError' || error.name === 'RpcError') {
     const msg = (error.message || '').toLowerCase();
@@ -59,6 +68,47 @@ function isFloodError(error) {
   
   const msg = (error.message || '').toLowerCase();
   return msg.includes('flood') || msg.includes('too many requests');
+}
+
+function isSlowModeError(error) {
+  const msg = (error.message || '').toLowerCase();
+  const name = error.name || '';
+  
+  if (name === 'SlowModeWaitError') {
+    return true;
+  }
+  
+  if (msg.includes('slow mode') || 
+      (msg.includes('wait of') && msg.includes('seconds') && msg.includes('before sending'))) {
+    return true;
+  }
+  
+  return false;
+}
+
+function isIgnorableError(error) {
+  const msg = (error.message || '').toLowerCase();
+  
+  // 1. Проблемы с сетью / сервером Telegram (временные)
+  if (msg.includes('rpc_call_fail')) return true;
+  if (msg.includes('internal') && msg.includes('server')) return true;
+  if (msg.includes('network') || msg.includes('connection')) return true;
+  if (msg.includes('timeout') || msg.includes('timed out')) return true;
+  if (msg.includes('eof') || msg.includes('socket')) return true;
+  
+  // 2. Проблемы с авторизацией (требуют перелогина, но не переassign)
+  if (msg.includes('auth_key_unregistered')) return true;
+  if (msg.includes('auth_bytes_invalid')) return true;
+  if (msg.includes('session_revoked')) return true;
+  if (msg.includes('session_expired')) return true;
+  
+  // 3. FLOOD уже обработан в isFloodError
+  if (isFloodError(error)) return true;
+  
+  // 4. SLOW MODE - просто пропускаем, чат НЕ переводим
+  if (isSlowModeError(error)) return true;
+  
+  return false;
 }
 
 // ========== РАБОТА С РАСПРЕДЕЛЕНИЕМ ==========
@@ -97,7 +147,7 @@ function initDistribution() {
   }
 }
 
-function reassignChat(chat, bannedBot) {
+async function reassignChat(chat, bannedBot) {
   console.log(`\n🔄 Чат ${chat} переводим от ${bannedBot} к следующему...`);
   
   if (distribution[bannedBot]) {
@@ -320,15 +370,13 @@ async function sendFromAccount(botPhone, botName, client, message) {
   
   console.log(`\n📤 ${botName} отправляет в ${botChats.length} чатов`);
   
-  const failedChats = [];
-  
   for (const chat of botChats) {
     try {
       const canSend = await ensureCanSend(client, chat);
       
       if (!canSend) {
         console.log(`  ❌ ${botName} -> ${chat}: НЕТ ДОСТУПА! Передаём другому...`);
-        failedChats.push({ chat, reason: 'no_access' });
+        await reassignChat(chat, botPhone);
         continue;
       }
       
@@ -336,50 +384,57 @@ async function sendFromAccount(botPhone, botName, client, message) {
       console.log(`  ✅ ${botName} -> ${chat}`);
       
     } catch (error) {
-      // 1. Проверяем на FLOOD (временное КД)
+      // 1. Slow mode - просто пропускаем этот чат в этом цикле, чат НЕ переводим
+      if (isSlowModeError(error)) {
+        const waitSeconds = getSlowModeWaitSeconds(error);
+        if (waitSeconds) {
+          console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE (ждём ${waitSeconds}с), пропускаем на этот раз`);
+        } else {
+          console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE, пропускаем на этот раз`);
+        }
+        console.log(`  📋 Тип ошибки: SlowModeWaitError → просто игнорируем, чат остаётся у этого аккаунта`);
+        // Ничего не делаем, continue - просто идём к следующему чату
+        continue;
+      }
+      
+      // 2. Flood - ждём и пробуем снова
       if (isFloodError(error)) {
         const waitSeconds = getFloodWaitSeconds(error) || 30;
-        console.log(`  🌊 FLOOD_WAIT в ${chat}: ждём ${waitSeconds} сек (чат НЕ переassign)`);
+        console.log(`  🌊 ${botName} -> ${chat}: FLOOD_WAIT ${waitSeconds}с, ждём...`);
         
         await new Promise(resolve => setTimeout(resolve, waitSeconds * 1000));
         
-        // Повторная попытка после ожидания
         try {
           await client.sendMessage(chat, { message });
           console.log(`  ✅ ${botName} -> ${chat}: успешно после FLOOD_WAIT`);
         } catch (retryError) {
-          if (isFloodError(retryError)) {
+          if (isSlowModeError(retryError)) {
+            console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE после FLOOD, пропускаем`);
+          } else if (isFloodError(retryError)) {
             console.log(`  ⏭️ ${botName} -> ${chat}: опять FLOOD, пропускаем на этот раз`);
           } else {
-            console.log(`  ❌ ${botName} -> ${chat}: повторная отправка не удалась: ${retryError.message.substring(0, 50)}`);
-            failedChats.push({ chat, reason: 'retry_failed' });
+            console.log(`  ❌ ${botName} -> ${chat}: повторная отправка не удалась, передаём другому`);
+            await reassignChat(chat, botPhone);
           }
         }
-        continue; // после flood не проверяем другие ошибки
+        continue;
       }
       
-      // 2. Проверяем на игнорируемые ошибки (сеть, авторизация, сервер)
+      // 3. Игнорируемые ошибки (сеть, авторизация, сервер, slow mode уже обработан)
       if (isIgnorableError(error)) {
         console.log(`  ⚠️ ${botName} -> ${chat}: ИГНОРИРУЕМ (${error.message.substring(0, 60)})`);
-        // ничего не делаем, чат остаётся у этого аккаунта
-        // просто ждём и идём дальше
         await new Promise(resolve => setTimeout(resolve, 5000));
         continue;
       }
       
-      // 3. Все остальные ошибки — проблема с доступом, переassign
+      // 4. Все остальные ошибки - переassign
       console.log(`  🚫 ${botName} -> ${chat}: ${error.message.substring(0, 80)}`);
-      console.log(`  📋 Тип ошибки: ${error.constructor.name}, не flood/сеть → передаём другому аккаунту`);
-      failedChats.push({ chat, reason: 'non_flood_error' });
+      console.log(`  📋 Тип ошибки: ${error.constructor.name}, переводим на другой аккаунт`);
+      await reassignChat(chat, botPhone);
     }
     
-    // Минимальная задержка между отправками в разные чаты
+    // Задержка между отправками
     await new Promise(resolve => setTimeout(resolve, 1000));
-  }
-  
-  // Переassign только тех чатов, где реально потерян доступ
-  for (const { chat } of failedChats) {
-    reassignChat(chat, botPhone);
   }
 }
 
@@ -589,27 +644,3 @@ main().catch((error) => {
   console.error('❌ Критическая ошибка:', error);
   process.exit(1);
 });
-
-function isIgnorableError(error) {
-  const msg = (error.message || '').toLowerCase();
-  const name = error.name || '';
-  
-  // 1. Проблемы с сетью / сервером Telegram (временные)
-  if (msg.includes('rpc_call_fail')) return true;        // [citation:7]
-  if (msg.includes('internal') && msg.includes('server')) return true;
-  if (msg.includes('network') || msg.includes('connection')) return true;
-  if (msg.includes('timeout') || msg.includes('timed out')) return true;
-  if (msg.includes('eof') || msg.includes('socket')) return true;
-  
-  // 2. Проблемы с авторизацией (требуют перелогина, но не переassign)
-  //    AUTH_KEY_UNREGISTERED — ключ не зарегистрирован, сессия протухла [citation:4][citation:9]
-  if (msg.includes('auth_key_unregistered')) return true;
-  if (msg.includes('auth_bytes_invalid')) return true;   // [citation:4]
-  if (msg.includes('session_revoked')) return true;
-  if (msg.includes('session_expired')) return true;
-  
-  // 3. FLOOD уже обработан в isFloodError, но на всякий случай
-  if (isFloodError(error)) return true;
-  
-  return false;
-}
