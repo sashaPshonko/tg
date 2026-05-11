@@ -86,29 +86,14 @@ function isSlowModeError(error) {
   return false;
 }
 
-function isIgnorableError(error) {
+function isNotMemberError(error) {
   const msg = (error.message || '').toLowerCase();
-  
-  // 1. Проблемы с сетью / сервером Telegram (временные)
-  if (msg.includes('rpc_call_fail')) return true;
-  if (msg.includes('internal') && msg.includes('server')) return true;
-  if (msg.includes('network') || msg.includes('connection')) return true;
-  if (msg.includes('timeout') || msg.includes('timed out')) return true;
-  if (msg.includes('eof') || msg.includes('socket')) return true;
-  
-  // 2. Проблемы с авторизацией (требуют перелогина, но не переassign)
-  if (msg.includes('auth_key_unregistered')) return true;
-  if (msg.includes('auth_bytes_invalid')) return true;
-  if (msg.includes('session_revoked')) return true;
-  if (msg.includes('session_expired')) return true;
-  
-  // 3. FLOOD уже обработан в isFloodError
-  if (isFloodError(error)) return true;
-  
-  // 4. SLOW MODE - просто пропускаем, чат НЕ переводим
-  if (isSlowModeError(error)) return true;
-  
-  return false;
+  return msg.includes('not a member') || 
+         msg.includes('not participated') ||
+         msg.includes('user not participant') ||
+         msg.includes('chat_write_forbidden') ||
+         msg.includes('user is not a member') ||
+         msg.includes('member access');
 }
 
 // ========== РАБОТА С РАСПРЕДЕЛЕНИЕМ ==========
@@ -232,7 +217,6 @@ async function joinChatByInviteLink(client, chatIdentifier) {
     }
     
     console.log(`   🔗 Вступаем по ссылке: ${chatIdentifier}`);
-    console.log(`   🔑 Invite hash: ${inviteHash}`);
     
     const result = await client.invoke(new Api.messages.ImportChatInvite({
       hash: inviteHash
@@ -242,7 +226,6 @@ async function joinChatByInviteLink(client, chatIdentifier) {
     return true;
   } catch (error) {
     console.log(`   ❌ Ошибка при вступлении: ${error.message}`);
-    console.log(`   📋 Тип ошибки: ${error.constructor.name}`);
     
     if (error.message.includes('already a participant')) {
       console.log(`   ℹ️ Уже участник чата`);
@@ -280,8 +263,7 @@ function isUsername(chatIdentifier) {
 
 async function joinPublicChatByUsername(client, username) {
   try {
-    const inviteLink = usernameToInviteLink(username);
-    console.log(`   🔗 Пробуем вступить по username: ${username} -> ${inviteLink}`);
+    console.log(`   🔗 Пробуем вступить по username: ${username}`);
     
     try {
       const entity = await client.getEntity(username);
@@ -298,64 +280,30 @@ async function joinPublicChatByUsername(client, username) {
       
       if (entity.className === 'Chat') {
         console.log(`   👥 Это группа, пробуем вступить...`);
+        const inviteLink = usernameToInviteLink(username);
         return await joinChatByInviteLink(client, inviteLink);
       }
       
     } catch (error) {
       console.log(`   ❌ Ошибка при работе с сущностью: ${error.message}`);
-      console.log(`   📋 Тип ошибки: ${error.constructor.name}`);
     }
     
-    return await joinChatByInviteLink(client, inviteLink);
+    return false;
   } catch (error) {
     console.log(`   ❌ Не удалось вступить в ${username}: ${error.message}`);
     return false;
   }
 }
 
-async function ensureCanSend(client, chatIdentifier) {
-  try {
-    console.log(`   📡 Пробуем отправить тестовое сообщение в ${chatIdentifier}...`);
-    await client.sendMessage(chatIdentifier, { message: '.' });
-    console.log(`   ✅ Тестовое сообщение отправлено успешно`);
-    return true;
-  } catch (error) {
-    console.log(`   ❌ Ошибка при отправке тестового сообщения: ${error.message}`);
-    console.log(`   📋 Тип ошибки: ${error.constructor.name}`);
-    
-    const errorMsg = error.message.toLowerCase();
-    
-    if (errorMsg.includes('not a member') || 
-        errorMsg.includes('not participated') ||
-        errorMsg.includes('user not participant') ||
-        errorMsg.includes('chat_write_forbidden') ||
-        errorMsg.includes('user is not a member')) {
-      
-      console.log(`   ⚠️ Аккаунт не участник чата! Пробуем вступить...`);
-      
-      let joined = false;
-      
-      if (chatIdentifier.includes('t.me/joinchat/') || chatIdentifier.includes('t.me/+')) {
-        console.log(`   🔗 Определено как ссылка-приглашение`);
-        joined = await joinChatByInviteLink(client, chatIdentifier);
-      } else if (isUsername(chatIdentifier)) {
-        console.log(`   👤 Определено как username: ${chatIdentifier}`);
-        joined = await joinPublicChatByUsername(client, chatIdentifier);
-      } else {
-        console.log(`   🔗 Пробуем как обычную ссылку`);
-        joined = await joinChatByInviteLink(client, chatIdentifier);
-      }
-      
-      if (joined) {
-        console.log(`   ⏳ Ждём 2 секунды после вступления...`);
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        return true;
-      } else {
-        console.log(`   ❌ Не удалось вступить в чат!`);
-      }
-    }
-    
-    return false;
+async function tryJoinChat(client, chat) {
+  console.log(`   🔗 Пробуем вступить в чат...`);
+  
+  if (chat.includes('t.me/joinchat/') || chat.includes('t.me/+')) {
+    return await joinChatByInviteLink(client, chat);
+  } else if (isUsername(chat)) {
+    return await joinPublicChatByUsername(client, chat);
+  } else {
+    return await joinChatByInviteLink(client, chat);
   }
 }
 
@@ -372,32 +320,25 @@ async function sendFromAccount(botPhone, botName, client, message) {
   
   for (const chat of botChats) {
     try {
-      const canSend = await ensureCanSend(client, chat);
-      
-      if (!canSend) {
-        console.log(`  ❌ ${botName} -> ${chat}: НЕТ ДОСТУПА! Передаём другому...`);
-        await reassignChat(chat, botPhone);
-        continue;
-      }
-      
+      // Пробуем отправить сообщение сразу, без тестового
       await client.sendMessage(chat, { message });
       console.log(`  ✅ ${botName} -> ${chat}`);
       
     } catch (error) {
-      // 1. Slow mode - просто пропускаем этот чат в этом цикле, чат НЕ переводим
+      // 1. SLOW MODE - просто пропускаем, чат НЕ ПЕРЕВОДИМ
       if (isSlowModeError(error)) {
         const waitSeconds = getSlowModeWaitSeconds(error);
         if (waitSeconds) {
-          console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE (ждём ${waitSeconds}с), пропускаем на этот раз`);
+          console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE (ждать ${waitSeconds}с), пропускаем в этом цикле`);
         } else {
-          console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE, пропускаем на этот раз`);
+          console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE, пропускаем в этом цикле`);
         }
-        console.log(`  📋 Тип ошибки: SlowModeWaitError → просто игнорируем, чат остаётся у этого аккаунта`);
-        // Ничего не делаем, continue - просто идём к следующему чату
+        console.log(`  📋 Тип ошибки: SlowModeWaitError → чат остаётся у этого аккаунта, попробуем в следующем цикле`);
+        // Просто пропускаем этот чат в текущем цикле
         continue;
       }
       
-      // 2. Flood - ждём и пробуем снова
+      // 2. FLOOD - ждём и пробуем снова
       if (isFloodError(error)) {
         const waitSeconds = getFloodWaitSeconds(error) || 30;
         console.log(`  🌊 ${botName} -> ${chat}: FLOOD_WAIT ${waitSeconds}с, ждём...`);
@@ -412,6 +353,20 @@ async function sendFromAccount(botPhone, botName, client, message) {
             console.log(`  🐌 ${botName} -> ${chat}: SLOW MODE после FLOOD, пропускаем`);
           } else if (isFloodError(retryError)) {
             console.log(`  ⏭️ ${botName} -> ${chat}: опять FLOOD, пропускаем на этот раз`);
+          } else if (isNotMemberError(retryError)) {
+            console.log(`  🔑 ${botName} -> ${chat}: нет доступа после FLOOD, пробуем вступить...`);
+            const joined = await tryJoinChat(client, chat);
+            if (joined) {
+              try {
+                await client.sendMessage(chat, { message });
+                console.log(`  ✅ ${botName} -> ${chat}: успешно после вступления`);
+              } catch (sendError) {
+                console.log(`  ❌ ${botName} -> ${chat}: не удалось отправить, передаём другому`);
+                await reassignChat(chat, botPhone);
+              }
+            } else {
+              await reassignChat(chat, botPhone);
+            }
           } else {
             console.log(`  ❌ ${botName} -> ${chat}: повторная отправка не удалась, передаём другому`);
             await reassignChat(chat, botPhone);
@@ -420,10 +375,24 @@ async function sendFromAccount(botPhone, botName, client, message) {
         continue;
       }
       
-      // 3. Игнорируемые ошибки (сеть, авторизация, сервер, slow mode уже обработан)
-      if (isIgnorableError(error)) {
-        console.log(`  ⚠️ ${botName} -> ${chat}: ИГНОРИРУЕМ (${error.message.substring(0, 60)})`);
-        await new Promise(resolve => setTimeout(resolve, 5000));
+      // 3. Нет доступа / не участник чата - пробуем вступить
+      if (isNotMemberError(error)) {
+        console.log(`  🔑 ${botName} -> ${chat}: нет доступа, пробуем вступить...`);
+        const joined = await tryJoinChat(client, chat);
+        
+        if (joined) {
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          try {
+            await client.sendMessage(chat, { message });
+            console.log(`  ✅ ${botName} -> ${chat}: успешно после вступления`);
+          } catch (sendError) {
+            console.log(`  ❌ ${botName} -> ${chat}: не удалось отправить после вступления, передаём другому`);
+            await reassignChat(chat, botPhone);
+          }
+        } else {
+          console.log(`  ❌ ${botName} -> ${chat}: не удалось вступить, передаём другому`);
+          await reassignChat(chat, botPhone);
+        }
         continue;
       }
       
@@ -625,7 +594,7 @@ async function main() {
   console.log(`📋 Всего чатов: ${allChats.length}`);
   console.log(`⏱️  Интервал: ${config.interval / 1000} секунд`);
   console.log(`🎲 Сообщения выбираются рандомно`);
-  console.log(`🔗 Аккаунты автоматически вступают в чаты по ссылкам-приглашениям\n`);
+  console.log(`🔗 Аккаунты автоматически вступают в чаты при необходимости\n`);
   
   await sendToAllChats();
   
@@ -644,4 +613,3 @@ main().catch((error) => {
   console.error('❌ Критическая ошибка:', error);
   process.exit(1);
 });
-//
